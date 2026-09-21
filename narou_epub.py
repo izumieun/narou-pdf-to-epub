@@ -74,12 +74,14 @@ def _column_parts(chars, ruby_groups, column_x, body_size, diagnostics, page_num
     rubies = {}
     for group in ruby_groups:
         rx = median(c['matrix'][4] for c in group)
-        # In these PDFs ruby is printed immediately to the left of its base column.
+        # Vertical ruby sits on the right side of its base column in these PDFs.
         if not (body_size * .3 < abs(column_x - rx) < body_size):
             continue
         low, high = min(c['top'] for c in group), max(c['bottom'] for c in group)
+        # A tiny overlap at a glyph boundary should not absorb the next base glyph.
+        minimum_overlap = min(body_size, high - low) * .25
         indices = [i for i, c in enumerate(ordered)
-                   if c['top'] < high and c['bottom'] > low]
+                   if min(c['bottom'], high) - max(c['top'], low) > minimum_overlap]
         if not indices:
             center = (low + high) / 2
             indices = [min(range(len(ordered)),
@@ -178,10 +180,10 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
             for rx, group in small_groups.items():
                 low, high = min(c['top'] for c in group), max(c['bottom'] for c in group)
                 candidates = [(-sum(c['top'] < high and c['bottom'] > low for c in cs),
-                               abs(x - rx), x)
+                               x >= rx, abs(x - rx), x)
                               for x, cs in columns if body_size * .3 < abs(x - rx) < body_size]
                 if candidates:
-                    _, _, closest = min(candidates)
+                    _, _, _, closest = min(candidates)
                     attached_to[closest].append(group)
                     remaining.discard(rx)
             column_data = []

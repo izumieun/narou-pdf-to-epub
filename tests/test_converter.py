@@ -64,6 +64,26 @@ class ConverterTests(TestCase):
         self.assertEqual(diagnostics['ruby_count'], 1)
         self.assertTrue(any(annotation == 'おや' for _, annotation in parts))
 
+    def test_ruby_on_wrapped_column_prefers_its_base_and_excludes_next_glyph(self):
+        # The preceding column is fractionally closer to the ruby at the same height.
+        ruby = chars('つい', 111.34, size=7, top=48.66)
+        pages = [FakePage(1, [], cover='題名\n著者'),
+                 FakePage(2, [chars('生き残りは', 122.60), chars('間を費やし調査', 100), ruby])]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            title, author, sections, diagnostics = extract(Path('sample.pdf'))
+        parts = sections[0].paragraphs[-1].parts
+        self.assertIn(('費', 'つい'), parts)
+        self.assertEqual([base for base, annotation in parts if annotation], ['費'])
+        self.assertEqual(diagnostics['ruby_count'], 1)
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'book.epub'
+            build_epub(target, title, author, sections)
+            with ZipFile(target) as archive:
+                chapter = ET.fromstring(archive.read('OEBPS/chapter-001.xhtml'))
+                ruby_nodes = chapter.findall(f'.//{{{XHTML}}}ruby')
+                self.assertEqual([(node.text, node.findtext(f'{{{XHTML}}}rt'))
+                                  for node in ruby_nodes], [('費', 'つい')])
+
     def test_epub_navigation_and_spine(self):
         pages = [FakePage(1, [], cover='題名\n著者'),
                  FakePage(2, [chars('第１話', 200, bold=True), chars('　本文です', 160)])]
