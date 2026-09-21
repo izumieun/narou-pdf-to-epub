@@ -32,31 +32,21 @@ bash scripts/setup.sh --python /usr/bin/python3.12
 
 Windowsは `.venv`、Linuxは `.venv-linux` をプロジェクト直下に作成します。同じ作業フォルダーをWindowsとLinuxで共有しても仮想環境が衝突しません。どちらも `requirements.txt` の固定バージョンを導入し、再実行時は既存の環境を再利用します。仮想環境の有効化は不要です。初回の依存取得には通信が必要ですが、PDF変換処理はオフラインです。Linuxで仮想環境の作成が失敗する場合は、使用中のPythonに対応する `venv` モジュールが導入されているか確認してください。
 
-## 抽出検証
-
-```powershell
-./.venv/Scripts/python.exe -X utf8 tools/probe_pdf.py path/to/input.pdf --reference-epub path/to/reference.epub --start-page 4 --end-page 5 --paragraphs 20 --output output/pdf-probe
-```
-
-Linuxでは `./.venv-linux/bin/python` に置き換えて実行します。
-
-検証用EPUBは抽出結果の照合にのみ使用します。現行の試作はサンプルの冒頭用であり、作品全体・ルビなどには未対応です。詳細は [SPECIFICATION.md](SPECIFICATION.md) を参照してください。
-
 ## 変換
 
 ```powershell
 mkdir output -ErrorAction SilentlyContinue
-./.venv/Scripts/python.exe -X utf8 narou_epub.py .dev/N4251CR.pdf output/N4251CR.epub
+./.venv/Scripts/python.exe -X utf8 narou_epub.py path/to/input.pdf output/converted.epub
 ```
 
 Linuxの場合：
 
 ```bash
 mkdir -p output
-./.venv-linux/bin/python -X utf8 narou_epub.py .dev/N4251CR.pdf output/N4251CR.epub
+./.venv-linux/bin/python -X utf8 narou_epub.py path/to/input.pdf output/converted.epub
 ```
 
-引数は入力PDFと出力EPUBです。表紙から書名・著者を取得できない場合は `--title` と `--author` を指定してください。既存のEPUBや診断JSONを置き換えるには `--overwrite` を付けます。出力先の親フォルダーは事前に作成してください。`.dev/` 内への出力は拒否します。
+`path/to/input.pdf` は変換したいPDFのパスに置き換えてください。引数は入力PDFと出力EPUBです。表紙から書名・著者を取得できない場合は `--title` と `--author` を指定してください。既存のEPUBや診断JSONを置き換えるには `--overwrite` を付けます。出力先の親フォルダーは事前に作成してください。`.dev/` 内への出力は拒否します。
 
 EPUBと同じ場所に `.report.json` を生成します。目次、段落数、除去したページ番号、ルビの判定、ページ境界の確認対象を確認できます。`--report` で診断JSONの出力先を変更できます。診断JSONに本文は保存しません。変換中の通信はありません。
 
