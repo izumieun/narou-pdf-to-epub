@@ -34,6 +34,8 @@ Windowsは `.venv`、Linuxは `.venv-linux` をプロジェクト直下に作成
 
 ## 変換
 
+### 1冊ずつ変換
+
 ```powershell
 mkdir output -ErrorAction SilentlyContinue
 ./.venv/Scripts/python.exe -X utf8 narou_epub.py path/to/input.pdf output/converted.epub
@@ -49,6 +51,24 @@ mkdir -p output
 `path/to/input.pdf` は変換したいPDFのパスに置き換えてください。引数は入力PDFと出力EPUBです。表紙から書名・著者を取得できない場合は `--title` と `--author` を指定してください。既存のEPUBや診断JSONを置き換えるには `--overwrite` を付けます。出力先の親フォルダーは事前に作成してください。`.dev/` 内への出力は拒否します。
 
 EPUBと同じ場所に `.report.json` を生成します。目次、段落数、除去したページ番号、ルビの判定、ページ境界の確認対象を確認できます。`--report` で診断JSONの出力先を変更できます。診断JSONに本文は保存しません。変換中の通信はありません。
+
+### フォルダ内のPDFを一括変換
+
+入力フォルダ直下にあるPDFを名前順に変換します。出力フォルダは存在しなければ作成されます。
+
+Windows (PowerShell)：
+
+```powershell
+./.venv/Scripts/python.exe -X utf8 narou_epub.py input output
+```
+
+Linux (Bash)：
+
+```bash
+./.venv-linux/bin/python -X utf8 narou_epub.py input output
+```
+
+例えば `input/novel.pdf` から `output/novel.epub` と `output/novel.report.json` を生成します。拡張子 `.PDF` も対象です。サブフォルダは処理しません。既存のEPUBまたは診断JSONがある作品はスキップし、置き換える場合は `--overwrite` を付けてください。1冊が失敗しても残りを処理し、最後に成功・スキップ・失敗件数を表示します。失敗があれば終了コードは1です。一括変換では各PDFの表紙から書名を取得します。共通の著者を指定する場合は `--author` を使えます。`--title` と `--report` は一括変換では使用できません。
 
 サンプルPDFでは37項目の目次を生成し、印刷ページ番号を除去しました。ページ境界の段落結合やルビは配置から推定するため、診断JSONの確認対象と出力の抜き取り確認を推奨します。画像だけのPDFはOCR非対応です。Kindle上での縦書き、目次メニュー、文字サイズ変更、ページ送りは実機で確認してください。
 

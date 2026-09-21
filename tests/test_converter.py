@@ -1,10 +1,12 @@
+from contextlib import redirect_stdout
+from io import StringIO
 import tempfile
 from pathlib import Path
 from unittest import TestCase, main, mock
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 
-from narou_epub import _column_parts, build_epub, extract, validate_epub, XHTML
+from narou_epub import _column_parts, build_epub, extract, main as convert_main, validate_epub, XHTML
 
 
 def chars(text, x, *, bold=False, size=14, top=20):
@@ -103,6 +105,76 @@ class ConverterTests(TestCase):
         with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
             with self.assertRaisesRegex(ValueError, '縦書き本文を抽出できません'):
                 extract(Path('sample.pdf'))
+
+    def test_batch_converts_pdfs_and_skips_existing_outputs(self):
+        pages = [FakePage(1, [], cover='題名\n著者'),
+                 FakePage(2, [chars('　本文です', 160)])]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'input'
+            target = Path(directory) / 'output'
+            source.mkdir()
+            (source / 'a.pdf').write_bytes(b'first')
+            (source / 'b.PDF').write_bytes(b'second')
+            (source / 'note.txt').write_text('ignore', encoding='utf-8')
+            with mock.patch('narou_epub.pdfplumber.open', side_effect=lambda _: FakePdf(pages)):
+                with redirect_stdout(StringIO()):
+                    convert_main([str(source), str(target)])
+            self.assertEqual(sorted(p.name for p in target.iterdir()),
+                             ['a.epub', 'a.report.json', 'b.epub', 'b.report.json'])
+            for name in ('a', 'b'):
+                validate_epub(target / f'{name}.epub', 1)
+            with mock.patch('narou_epub.pdfplumber.open', side_effect=AssertionError('converted again')):
+                with redirect_stdout(StringIO()) as output:
+                    convert_main([str(source), str(target)])
+            self.assertIn('スキップ 2件', output.getvalue())
+            updated_pages = [FakePage(1, [], cover='題名\n著者'),
+                             FakePage(2, [chars('　変更本文', 160)])]
+            with mock.patch('narou_epub.pdfplumber.open',
+                            side_effect=lambda _: FakePdf(updated_pages)) as opened:
+                with redirect_stdout(StringIO()):
+                    convert_main([str(source), str(target), '--overwrite'])
+            self.assertEqual(opened.call_count, 2)
+            with ZipFile(target / 'a.epub') as archive:
+                self.assertIn('変更本文', archive.read('OEBPS/chapter-001.xhtml').decode('utf-8'))
+
+    def test_single_pdf_cli_still_accepts_an_epub_path(self):
+        pages = [FakePage(1, [], cover='題名\n著者'),
+                 FakePage(2, [chars('　本文です', 160)])]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'book.pdf'
+            target = Path(directory) / 'renamed.epub'
+            source.write_bytes(b'sample')
+            with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+                with redirect_stdout(StringIO()):
+                    convert_main([str(source), str(target)])
+            validate_epub(target, 1)
+            self.assertTrue(target.with_suffix('.report.json').is_file())
+
+    def test_batch_failure_does_not_prevent_next_pdf(self):
+        pages = [FakePage(1, [], cover='題名\n著者'),
+                 FakePage(2, [chars('　本文です', 160)])]
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'input'
+            target = Path(directory) / 'output'
+            source.mkdir()
+            (source / 'a.pdf').write_bytes(b'invalid')
+            (source / 'b.pdf').write_bytes(b'valid')
+
+            def open_pdf(path):
+                if path.name == 'a.pdf':
+                    raise ValueError('invalid PDF')
+                return FakePdf(pages)
+
+            with mock.patch('narou_epub.pdfplumber.open', side_effect=open_pdf):
+                with redirect_stdout(StringIO()) as output:
+                    with mock.patch('sys.stderr', new_callable=StringIO) as errors:
+                        with self.assertRaises(SystemExit) as failure:
+                            convert_main([str(source), str(target)])
+            self.assertEqual(failure.exception.code, 1)
+            self.assertIn('a.pdf', errors.getvalue())
+            self.assertIn('成功 1件', output.getvalue())
+            validate_epub(target / 'b.epub', 1)
+            self.assertFalse((target / 'a.epub').exists())
 
 
 if __name__ == '__main__':

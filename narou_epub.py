@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 from statistics import median
+import sys
 import uuid
 import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
@@ -363,10 +364,35 @@ def _protected(path: Path) -> bool:
     return any(part.casefold() == '.dev' for part in path.resolve().parts)
 
 
+def _convert_one(source: Path, output: Path, report: Path, title_override=None,
+                 author_override=None):
+    with source.open('rb') as stream:
+        source_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
+    title, author, sections, diagnostics = extract(source, title_override, author_override)
+    temporary = output.with_name(output.name + '.tmp')
+    if temporary.exists():
+        raise ValueError(f'一時ファイルが既にあります: {temporary}')
+    try:
+        build_epub(temporary, title, author, sections)
+        validate_epub(temporary, len(sections))
+        with source.open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != source_hash:
+                raise ValueError('変換中に入力PDFが変更されました。')
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+    summary = {'title': title, 'author': author, 'source_sha256': source_hash, 'sections':
+               [{'title': s.title, 'page': s.page, 'paragraphs': len(s.paragraphs)} for s in sections],
+               'paragraph_count': sum(len(s.paragraphs) for s in sections),
+               'diagnostics': diagnostics}
+    report.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f'EPUB: {output}\n診断: {report}\n目次: {len(sections)}項目、段落: {summary["paragraph_count"]}')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='小説家になろう縦書きPDFを縦書きEPUBへ変換します。')
-    parser.add_argument('pdf', type=Path)
-    parser.add_argument('output', type=Path)
+    parser.add_argument('pdf', type=Path, help='入力PDF、またはPDFを格納したフォルダ')
+    parser.add_argument('output', type=Path, help='出力EPUB、または出力フォルダ')
     parser.add_argument('--title', help='書籍タイトルを上書き')
     parser.add_argument('--author', help='著者名を上書き')
     parser.add_argument('--report', type=Path, help='診断JSONの出力先。既定はEPUBと同名の .report.json')
@@ -374,6 +400,43 @@ def main(argv=None):
     args = parser.parse_args(argv)
     source = args.pdf.resolve()
     output = args.output.resolve()
+    if source.is_dir():
+        if args.title or args.report:
+            parser.error('フォルダ指定では --title と --report は使用できません。')
+        if _protected(output):
+            parser.error('.dev 内には出力できません。')
+        if output.exists() and not output.is_dir():
+            parser.error(f'出力先はフォルダを指定してください: {output}')
+        pdfs = sorted((path for path in source.iterdir()
+                       if path.is_file() and path.suffix.casefold() == '.pdf'),
+                      key=lambda path: (path.name.casefold(), path.name))
+        if not pdfs:
+            parser.error(f'入力フォルダにPDFがありません: {source}')
+        names = [path.stem.casefold() for path in pdfs]
+        if len(names) != len(set(names)):
+            parser.error('同名の出力になるPDFがあります。入力PDFのファイル名を変更してください。')
+        try:
+            output.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            parser.exit(1, f'出力フォルダの作成に失敗しました: {exc}\n')
+        converted = skipped = failed = 0
+        for pdf in pdfs:
+            epub = output / f'{pdf.stem}.epub'
+            report = output / f'{pdf.stem}.report.json'
+            if not args.overwrite and (epub.exists() or report.exists()):
+                print(f'スキップ（出力が既存）: {pdf.name}')
+                skipped += 1
+                continue
+            try:
+                _convert_one(pdf, epub, report, author_override=args.author)
+                converted += 1
+            except Exception as exc:
+                print(f'変換失敗 ({pdf.name}; {type(exc).__name__}): {exc}', file=sys.stderr)
+                failed += 1
+        print(f'一括処理: 成功 {converted}件、スキップ {skipped}件、失敗 {failed}件')
+        if failed:
+            raise SystemExit(1)
+        return
     report = (args.report or args.output.with_suffix('.report.json')).resolve()
     if not source.is_file():
         parser.error(f'入力PDFがありません: {source}')
@@ -388,27 +451,7 @@ def main(argv=None):
     if not output.parent.is_dir() or not report.parent.is_dir():
         parser.error('出力先の親ディレクトリがありません。')
     try:
-        with source.open('rb') as stream:
-            source_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
-        title, author, sections, diagnostics = extract(source, args.title, args.author)
-        temporary = output.with_name(output.name + '.tmp')
-        if temporary.exists():
-            raise ValueError(f'一時ファイルが既にあります: {temporary}')
-        try:
-            build_epub(temporary, title, author, sections)
-            validate_epub(temporary, len(sections))
-            with source.open('rb') as stream:
-                if hashlib.file_digest(stream, 'sha256').hexdigest() != source_hash:
-                    raise ValueError('変換中に入力PDFが変更されました。')
-            temporary.replace(output)
-        finally:
-            temporary.unlink(missing_ok=True)
-        summary = {'title': title, 'author': author, 'source_sha256': source_hash, 'sections':
-                   [{'title': s.title, 'page': s.page, 'paragraphs': len(s.paragraphs)} for s in sections],
-                   'paragraph_count': sum(len(s.paragraphs) for s in sections),
-                   'diagnostics': diagnostics}
-        report.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
-        print(f'EPUB: {output}\n診断: {report}\n目次: {len(sections)}項目、段落: {summary["paragraph_count"]}')
+        _convert_one(source, output, report, args.title, args.author)
     except Exception as exc:
         parser.exit(1, f'変換失敗 ({type(exc).__name__}): {exc}\n')
 
