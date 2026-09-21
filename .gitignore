@@ -1,0 +1,10 @@
+.dev/
+.work-notes/
+tmp/
+output/
+.venv/
+.venv-linux/
+__pycache__/
+*.py[cod]
+*.epub
+*.report.json
