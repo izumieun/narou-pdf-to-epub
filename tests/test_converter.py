@@ -17,13 +17,23 @@ def chars(text, x, *, bold=False, size=14, top=20):
             for i, value in enumerate(text)]
 
 
+def horizontal_chars(text, center, *, size=12, top=180):
+    step = size * .62
+    start = center - step * (len(text) - 1) / 2
+    return [{'text': value, 'matrix': (1, 0, 0, 1, start + i * step, 20),
+             'top': top, 'bottom': top + size, 'x0': start + i * step,
+             'size': size, 'fontname': 'Novel-Regular'}
+            for i, value in enumerate(text)]
+
+
 class FakePage:
     def __init__(self, number, columns, footer=None, cover=None):
         self.page_number = number
         self.height = 200
+        self.width = 300
         self.chars = [c for column in columns for c in column]
         if footer is not None:
-            self.chars += chars(footer, 60, size=12, top=180)
+            self.chars += horizontal_chars(footer, self.width / 2)
         self.cover = cover
 
     def extract_text(self):
@@ -85,6 +95,18 @@ class ConverterTests(TestCase):
                 ruby_nodes = chapter.findall(f'.//{{{XHTML}}}ruby')
                 self.assertEqual([(node.text, node.findtext(f'{{{XHTML}}}rt'))
                                   for node in ruby_nodes], [('費', 'つい')])
+
+    def test_page_number_is_removed_when_small_body_dots_reach_footer_area(self):
+        body = chars('　ある程度なら我慢できるが、呼ばわりされてもできない。', 100)
+        page = FakePage(2, [body], footer='3661')
+        page.chars += chars('・・・', 111, size=7, top=166)
+        pages = [FakePage(1, [], cover='題名\n著者'), page]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            _, _, sections, diagnostics = extract(Path('sample.pdf'))
+        annotations = [annotation for section in sections for paragraph in section.paragraphs
+                       for _, annotation in paragraph.parts if annotation]
+        self.assertFalse(any(annotation.isdecimal() for annotation in annotations))
+        self.assertEqual(diagnostics['removed_page_numbers'], [{'page': 2, 'number': '3661'}])
 
     def test_epub_navigation_and_spine(self):
         pages = [FakePage(1, [], cover='題名\n著者'),

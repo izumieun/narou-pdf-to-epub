@@ -115,6 +115,28 @@ def _column_parts(chars, ruby_groups, column_x, body_size, diagnostics, page_num
     return parts
 
 
+def _page_number_group(chars, page_width, page_height, body_size):
+    """Find a small horizontal decimal run centered in the bottom margin."""
+    candidates = [c for c in chars
+                  if c['text'].isdecimal()
+                  and body_size * .65 <= c['size'] < body_size - .25
+                  and c['top'] > page_height - body_size * 5]
+    rows = defaultdict(list)
+    for char in candidates:
+        rows[(round(char['top'], 1), round(char['size'], 1), char['fontname'])].append(char)
+    matches = []
+    for row in rows.values():
+        ordered = sorted(row, key=lambda c: c['matrix'][4])
+        xs = [c['matrix'][4] for c in ordered]
+        if any(not 0 < right - left < body_size for left, right in zip(xs, xs[1:])):
+            continue
+        center = (xs[0] + xs[-1]) / 2
+        if abs(center - page_width / 2) > body_size:
+            continue
+        matches.append((abs(center - page_width / 2), -len(ordered), ordered))
+    return min(matches, key=lambda item: item[:2])[2] if matches else []
+
+
 def extract(pdf_path: Path, title_override=None, author_override=None):
     diagnostics = {'removed_page_numbers': [], 'ruby_count': 0,
                    'ruby_ambiguous': [], 'unassigned_small_text': [],
@@ -145,21 +167,17 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
             # Reject pages made of horizontal colophon text instead of vertical columns.
             groups = defaultdict(list)
             small = []
-            footer = []
             for c in page.chars:
                 if abs(c['size'] - body_size) <= .25:
                     groups[round(c['matrix'][4], 2)].append(c)
-                elif c['size'] < body_size and c['top'] > page.height * .8:
-                    footer.append(c)
                 else:
                     small.append(c)
+            footer = _page_number_group(small, page.width, page.height, body_size)
             if footer:
-                footer_text = ''.join(c['text'] for c in sorted(footer, key=lambda c: c['x0']))
-                if footer_text.isdecimal():
-                    diagnostics['removed_page_numbers'].append({'page': page.page_number,
-                                                                 'number': footer_text})
-                else:
-                    small.extend(footer)
+                footer_ids = {id(c) for c in footer}
+                small = [c for c in small if id(c) not in footer_ids]
+                diagnostics['removed_page_numbers'].append(
+                    {'page': page.page_number, 'number': ''.join(c['text'] for c in footer)})
             columns = [(x, cs) for x, cs in sorted(groups.items(), reverse=True) if len(cs) >= 2]
             if not columns or max(len(cs) for _, cs in columns) < 4:
                 lines = [line.strip() for line in (page.extract_text() or '').splitlines() if line.strip()]
