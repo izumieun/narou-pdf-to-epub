@@ -55,17 +55,40 @@ class ConverterTests(TestCase):
     def test_reading_order_headings_blanks_page_boundary_and_digits(self):
         pages = [FakePage(1, [], cover='題名\n著者\n出版社'),
                  FakePage(2, [chars('第１話', 200, bold=True),
-                              chars('　今日は123', 160), chars('続く', 140),
-                              chars('　次', 100), chars('太字本文', 80, bold=True)], footer='1'),
-                 FakePage(3, [chars('　翌日です', 160), chars('４５', 140)], footer='2')]
+                              chars('　今日は123456', 160), chars('続く', 140),
+                              chars('　次あいうえおかきくけ', 100), chars('太字本文', 80, bold=True)], footer='1'),
+                 FakePage(3, [chars('　翌日ですあいうえお', 160), chars('４５', 140)], footer='2')]
         with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
             title, author, sections, diagnostics = extract(Path('sample.pdf'))
         self.assertEqual((title, author), ('題名', '著者'))
         self.assertEqual([s.title for s in sections], ['題名', '第１話'])
         self.assertEqual([p.text for p in sections[1].paragraphs],
-                         ['　今日は123続く', '　次太字本文', '　翌日です４５'])
+                         ['　今日は123456続く', '　次あいうえおかきくけ太字本文', '　翌日ですあいうえお４５'])
         self.assertEqual(sections[1].paragraphs[1].blank_before, 1)
         self.assertEqual([x['number'] for x in diagnostics['removed_page_numbers']], ['1', '2'])
+
+    def test_short_aligned_columns_keep_list_line_breaks(self):
+        entries = ['項目一：説明文一', '項目二：説明文二',
+                   '項目三：説明文三', '項目四：説明文四']
+        list_page = FakePage(2, [chars('人物一覧', 260, bold=True),
+                                 *[chars(entry, 200 - i * 20, top=80)
+                                   for i, entry in enumerate(entries)]])
+        list_page.height = 600
+        prose_page = FakePage(3, [chars('　' + '文章' * 17, 200, top=20),
+                                  chars('続き', 180, top=20)])
+        prose_page.height = 600
+        pages = [FakePage(1, [], cover='題名\n著者'), list_page, prose_page]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            title, author, sections, _ = extract(Path('sample.pdf'))
+        self.assertEqual([p.text for p in sections[1].paragraphs[:4]], entries)
+        self.assertEqual(sections[1].paragraphs[4].text, '　' + '文章' * 17 + '続き')
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'book.epub'
+            build_epub(target, title, author, sections)
+            with ZipFile(target) as archive:
+                chapter = ET.fromstring(archive.read('OEBPS/chapter-002.xhtml'))
+                lines = chapter.findall(f'.//{{{XHTML}}}p')
+                self.assertEqual([''.join(line.itertext()) for line in lines[:4]], entries)
 
     def test_ruby_attaches_to_base_text(self):
         base = chars('親文字', 100)
@@ -78,14 +101,14 @@ class ConverterTests(TestCase):
 
     def test_ruby_on_wrapped_column_prefers_its_base_and_excludes_next_glyph(self):
         # The preceding column is fractionally closer to the ruby at the same height.
-        ruby = chars('つい', 111.34, size=7, top=48.66)
+        ruby = chars('るび', 111.34, size=7, top=48.66)
         pages = [FakePage(1, [], cover='題名\n著者'),
-                 FakePage(2, [chars('生き残りは', 122.60), chars('間を費やし調査', 100), ruby])]
+                 FakePage(2, [chars('あいうえお', 122.60), chars('甲乙丙丁戊己庚', 100), ruby])]
         with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
             title, author, sections, diagnostics = extract(Path('sample.pdf'))
         parts = sections[0].paragraphs[-1].parts
-        self.assertIn(('費', 'つい'), parts)
-        self.assertEqual([base for base, annotation in parts if annotation], ['費'])
+        self.assertIn(('丙', 'るび'), parts)
+        self.assertEqual([base for base, annotation in parts if annotation], ['丙'])
         self.assertEqual(diagnostics['ruby_count'], 1)
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'book.epub'
@@ -94,10 +117,10 @@ class ConverterTests(TestCase):
                 chapter = ET.fromstring(archive.read('OEBPS/chapter-001.xhtml'))
                 ruby_nodes = chapter.findall(f'.//{{{XHTML}}}ruby')
                 self.assertEqual([(node.text, node.findtext(f'{{{XHTML}}}rt'))
-                                  for node in ruby_nodes], [('費', 'つい')])
+                                  for node in ruby_nodes], [('丙', 'るび')])
 
     def test_page_number_is_removed_when_small_body_dots_reach_footer_area(self):
-        body = chars('　ある程度なら我慢できるが、呼ばわりされてもできない。', 100)
+        body = chars('　これは検証用の文です。点を残します。', 100)
         page = FakePage(2, [body], footer='3661')
         page.chars += chars('・・・', 111, size=7, top=166)
         pages = [FakePage(1, [], cover='題名\n著者'), page]
@@ -107,6 +130,69 @@ class ConverterTests(TestCase):
                        for _, annotation in paragraph.parts if annotation]
         self.assertFalse(any(annotation.isdecimal() for annotation in annotations))
         self.assertEqual(diagnostics['removed_page_numbers'], [{'page': 2, 'number': '3661'}])
+
+    def test_shifted_page_numbers_on_chapter_openings_are_not_ruby(self):
+        for number in ('3710', '3724'):
+            with self.subTest(number=number):
+                physical_page = int(number) + 1
+                prior = FakePage(physical_page - 1, [chars('　前のページの本文です。', 100)],
+                                 footer=str(int(number) - 1))
+                opening = FakePage(physical_page,
+                                   [chars('「……」仮の見本文が続きます。', 100)])
+                opening.chars += horizontal_chars(number, opening.width / 2 - 19)
+                pages = [FakePage(1, [], cover='題名\n著者'), prior, opening]
+                with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+                    _, _, sections, diagnostics = extract(Path('sample.pdf'))
+                annotations = [annotation for section in sections for paragraph in section.paragraphs
+                               for _, annotation in paragraph.parts if annotation]
+                self.assertFalse(any(annotation.isdecimal() for annotation in annotations))
+                self.assertEqual(diagnostics['removed_page_numbers'],
+                                 [{'page': physical_page - 1, 'number': str(int(number) - 1)},
+                                  {'page': physical_page, 'number': number}])
+
+    def test_first_shifted_footer_uses_following_page_as_reference(self):
+        first = FakePage(2, [chars('　本文が始まります。', 100)])
+        first.chars += horizontal_chars('1', first.width / 2 - 30)
+        second = FakePage(3, [chars('　次のページです。', 100)], footer='2')
+        pages = [FakePage(1, [], cover='題名\n著者'), first, second]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            _, _, _, diagnostics = extract(Path('sample.pdf'))
+        self.assertEqual(diagnostics['removed_page_numbers'],
+                         [{'page': 2, 'number': '1'}, {'page': 3, 'number': '2'}])
+
+    def test_sparse_page_uses_footer_sequence_when_ruby_is_most_common_size(self):
+        prior = FakePage(5844, [chars('　前のページです。', 100)], footer='5843')
+        sparse = FakePage(5845, [chars('本文です。続', 100),
+                                 chars('ふりがながたくさん', 111, size=7)], footer='5844')
+        pages = [FakePage(1, [], cover='題名\n著者'), prior, sparse]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            _, _, sections, diagnostics = extract(Path('sample.pdf'))
+        self.assertIn({'page': 5845, 'number': '5844'},
+                      diagnostics['removed_page_numbers'])
+        self.assertIn('本文です。続', ''.join(p.text for section in sections
+                                           for p in section.paragraphs))
+
+    def test_footer_is_removed_when_it_matches_body_font_size(self):
+        prior = FakePage(2, [chars('　本文です。', 100)], footer='1')
+        final = FakePage(3, [chars('　後書きです。', 100, size=12)], footer='2')
+        pages = [FakePage(1, [], cover='題名\n著者'), prior, final]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            _, _, sections, diagnostics = extract(Path('sample.pdf'))
+        self.assertIn({'page': 3, 'number': '2'}, diagnostics['removed_page_numbers'])
+        self.assertNotIn('2', ''.join(paragraph.text for section in sections
+                                      for paragraph in section.paragraphs))
+
+    def test_horizontal_colophon_does_not_turn_url_digits_into_ruby(self):
+        prior = FakePage(2, [chars('　本文です。', 100)], footer='1')
+        rows = [horizontal_chars('0123456789ABCDEFGHIJ', 150, top=20 + i * 15)
+                for i in range(4)]
+        colophon = FakePage(3, rows, footer='2', cover='出版情報\nURL: example.invalid/book42')
+        pages = [FakePage(1, [], cover='題名\n著者'), prior, colophon]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            _, _, sections, diagnostics = extract(Path('sample.pdf'))
+        self.assertIn(3, diagnostics['horizontal_pages'])
+        self.assertIn('URL: example.invalid/book42', [p.text for p in sections[-1].paragraphs])
+        self.assertEqual(diagnostics['ruby_count'], 0)
 
     def test_epub_navigation_and_spine(self):
         pages = [FakePage(1, [], cover='題名\n著者'),

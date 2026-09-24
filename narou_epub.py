@@ -115,26 +115,55 @@ def _column_parts(chars, ruby_groups, column_x, body_size, diagnostics, page_num
     return parts
 
 
-def _page_number_group(chars, page_width, page_height, body_size):
-    """Find a small horizontal decimal run centered in the bottom margin."""
-    candidates = [c for c in chars
-                  if c['text'].isdecimal()
-                  and body_size * .65 <= c['size'] < body_size - .25
-                  and c['top'] > page_height - body_size * 5]
+def _page_number_group(chars, page_width, page_height, body_size,
+                       previous_footer=None, page_number=None):
+    """Find a footer number by its bottom position and page sequence."""
+    candidates = []
+    for char in chars:
+        if not char['text'].isdecimal():
+            continue
+        ordinary_footer = (body_size * .65 <= char['size'] < body_size - .25
+                           and char['top'] > page_height - body_size * 5)
+        matches_reference = False
+        if previous_footer:
+            _, _, last_bottom, last_size = previous_footer
+            matches_reference = (abs(char['size'] - last_size) <= .25
+                                 and abs((page_height - char['top']) - last_bottom)
+                                 <= max(body_size, last_size) / 2)
+        if ordinary_footer or matches_reference:
+            candidates.append(char)
     rows = defaultdict(list)
     for char in candidates:
         rows[(round(char['top'], 1), round(char['size'], 1), char['fontname'])].append(char)
     matches = []
+    gap_limit = max(body_size, previous_footer[3]) if previous_footer else body_size
     for row in rows.values():
         ordered = sorted(row, key=lambda c: c['matrix'][4])
-        xs = [c['matrix'][4] for c in ordered]
-        if any(not 0 < right - left < body_size for left, right in zip(xs, xs[1:])):
-            continue
-        center = (xs[0] + xs[-1]) / 2
-        if abs(center - page_width / 2) > body_size:
-            continue
-        matches.append((abs(center - page_width / 2), -len(ordered), ordered))
-    return min(matches, key=lambda item: item[:2])[2] if matches else []
+        runs = []
+        for char in ordered:
+            if not runs or not 0 < char['matrix'][4] - runs[-1][-1]['matrix'][4] < gap_limit:
+                runs.append([char])
+            else:
+                runs[-1].append(char)
+        for run in runs:
+            center = (run[0]['matrix'][4] + run[-1]['matrix'][4]) / 2
+            near_center = abs(center - page_width / 2) <= body_size
+            sequential = False
+            if previous_footer and page_number is not None:
+                last_page, last_number, last_bottom, last_size = previous_footer
+                sequential = (int(''.join(c['text'] for c in run)) ==
+                              last_number + page_number - last_page
+                              and abs((page_height - run[0]['top']) - last_bottom)
+                              <= max(body_size, last_size) / 2
+                              and abs(run[0]['size'] - last_size) <= .25)
+            if sequential or (previous_footer is None and near_center):
+                matches.append((not sequential, abs(center - page_width / 2), -len(run), run))
+    return min(matches, key=lambda item: item[:3])[3] if matches else []
+
+
+def _footer_reference(page, group):
+    return (page.page_number, int(''.join(c['text'] for c in group)),
+            page.height - group[0]['top'], group[0]['size'])
 
 
 def extract(pdf_path: Path, title_override=None, author_override=None):
@@ -143,6 +172,8 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
                    'page_boundary_review': [], 'skipped_pages': [], 'horizontal_pages': []}
     sections = []
     previous = None
+    previous_footer = None
+    previous_body_size = None
     vertical_body_count = 0
     with pdfplumber.open(pdf_path) as pdf:
         if not pdf.pages:
@@ -158,32 +189,57 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
         cover_paragraphs.extend(Paragraph([(line.strip(), None)], pages=[1])
                                 for line in cover_lines[2:] if line.strip())
         sections.append(Section(title, 1, cover_paragraphs))
+        # A centered footer on an early page also identifies a shifted first footer.
+        for sample_page in pdf.pages[2:6]:
+            if not sample_page.chars:
+                continue
+            sample_size = Counter(round(c['size'], 1) for c in sample_page.chars).most_common(1)[0][0]
+            sample_footer = _page_number_group(sample_page.chars, sample_page.width,
+                                                sample_page.height, sample_size)
+            if sample_footer:
+                previous_footer = _footer_reference(sample_page, sample_footer)
+                break
         for page in pdf.pages[1:]:
             if not page.chars:
                 diagnostics['skipped_pages'].append(page.page_number)
                 continue
             sizes = Counter(round(c['size'], 1) for c in page.chars)
             body_size = sizes.most_common(1)[0][0]
+            if previous_body_size and body_size < previous_body_size * .75:
+                prior_columns = Counter(round(c['matrix'][4], 2) for c in page.chars
+                                        if abs(c['size'] - previous_body_size) <= .25)
+                if max(prior_columns.values(), default=0) >= 4:
+                    body_size = previous_body_size
+            previous_body_size = body_size
             # Reject pages made of horizontal colophon text instead of vertical columns.
+            footer = _page_number_group(page.chars, page.width, page.height, body_size,
+                                        previous_footer, page.page_number)
+            footer_ids = {id(c) for c in footer}
             groups = defaultdict(list)
             small = []
             for c in page.chars:
+                if id(c) in footer_ids:
+                    continue
                 if abs(c['size'] - body_size) <= .25:
                     groups[round(c['matrix'][4], 2)].append(c)
                 else:
                     small.append(c)
-            footer = _page_number_group(small, page.width, page.height, body_size)
             if footer:
-                footer_ids = {id(c) for c in footer}
-                small = [c for c in small if id(c) not in footer_ids]
+                footer_text = ''.join(c['text'] for c in footer)
                 diagnostics['removed_page_numbers'].append(
-                    {'page': page.page_number, 'number': ''.join(c['text'] for c in footer)})
+                    {'page': page.page_number, 'number': footer_text})
+                previous_footer = _footer_reference(page, footer)
             columns = [(x, cs) for x, cs in sorted(groups.items(), reverse=True) if len(cs) >= 2]
-            if not columns or max(len(cs) for _, cs in columns) < 4:
+            row_counts = Counter(round(c['top'], 1) for cs in groups.values() for c in cs)
+            tallest_column = max((len(cs) for _, cs in columns), default=0)
+            looks_horizontal = max(row_counts.values(), default=0) > tallest_column * 2
+            if tallest_column < 4 or looks_horizontal:
                 lines = [line.strip() for line in (page.extract_text() or '').splitlines() if line.strip()]
                 if lines and lines[-1].isdecimal():
-                    diagnostics['removed_page_numbers'].append({'page': page.page_number,
-                                                                 'number': lines.pop()})
+                    number = lines.pop()
+                    if not footer or number != footer_text:
+                        diagnostics['removed_page_numbers'].append({'page': page.page_number,
+                                                                     'number': number})
                 if lines:
                     diagnostics['horizontal_pages'].append(page.page_number)
                     for line in lines:
@@ -212,6 +268,7 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
                 bold = sum('Bold' in c['fontname'] for c in cs) / len(cs) >= .8
                 column_data.append({'x': x, 'parts': parts, 'text': ''.join(v for v, _ in parts),
                                     'bold': bold, 'page': page.page_number,
+                                    'top': min(c['top'] for c in cs),
                                     'bottom': max(c['bottom'] for c in cs)})
             for rx in remaining:
                 diagnostics['unassigned_small_text'].append({'page': page.page_number, 'x': rx,
@@ -236,9 +293,11 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
                 vertical_body_count += 1
                 gap = previous['x'] - col['x'] if previous and previous['page'] == page.page_number else None
                 blank = max(0, min(3, round(gap / pitch) - 1)) if gap is not None else 0
+                short_previous_line = (gap is not None and previous['bottom'] < page.height * .8
+                                       and abs(previous['top'] - col['top']) <= body_size)
                 starts = col['text'].startswith('\u3000') or (
                     col['text'].startswith(('「', '『')) and previous is not None
-                    and previous['bottom'] < page.height * .8)
+                    and previous['bottom'] < page.height * .8) or short_previous_line
                 if not section.paragraphs or starts or blank:
                     section.paragraphs.append(Paragraph(blank_before=blank))
                 elif previous and previous['page'] != page.page_number:
