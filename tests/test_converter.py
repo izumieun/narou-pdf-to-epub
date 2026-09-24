@@ -6,7 +6,7 @@ from unittest import TestCase, main, mock
 from zipfile import ZipFile
 import xml.etree.ElementTree as ET
 
-from narou_epub import _column_parts, build_epub, extract, main as convert_main, validate_epub, XHTML
+from narou_epub import _column_parts, build_epub, extract, main as convert_main, validate_epub, DC, XHTML
 
 
 def chars(text, x, *, bold=False, size=14, top=20):
@@ -52,6 +52,26 @@ class FakePdf:
 
 
 class ConverterTests(TestCase):
+    def test_wrapped_cover_title_does_not_become_author(self):
+        cover = FakePage(1, [], cover='架空の長い書名\n続き\n仮の著者\n発行元')
+        cover.chars = (horizontal_chars('架空の長い書名', 150, size=20, top=20)
+                       + horizontal_chars('続き', 150, size=20, top=50)
+                       + horizontal_chars('仮の著者', 150, size=12, top=100)
+                       + horizontal_chars('発行元', 150, size=12, top=160))
+        pages = [cover, FakePage(2, [chars('　本文です。', 160)])]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            title, author, sections, _ = extract(Path('sample.pdf'))
+        self.assertEqual((title, author), ('架空の長い書名続き', '仮の著者'))
+        self.assertEqual([paragraph.text for paragraph in sections[0].paragraphs[:2]],
+                         ['仮の著者', '発行元'])
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'book.epub'
+            build_epub(target, title, author, sections)
+            with ZipFile(target) as archive:
+                package = ET.fromstring(archive.read('OEBPS/package.opf'))
+                self.assertEqual(package.findtext(f'.//{{{DC}}}title'), title)
+                self.assertEqual(package.findtext(f'.//{{{DC}}}creator'), author)
+
     def test_reading_order_headings_blanks_page_boundary_and_digits(self):
         pages = [FakePage(1, [], cover='題名\n著者\n出版社'),
                  FakePage(2, [chars('第１話', 200, bold=True),

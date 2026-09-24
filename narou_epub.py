@@ -166,6 +166,28 @@ def _footer_reference(page, group):
             page.height - group[0]['top'], group[0]['size'])
 
 
+def _cover_fields(page):
+    lines = [line.strip() for line in (page.extract_text() or '').splitlines() if line.strip()]
+    if not lines:
+        return '', '', []
+
+    # Cover titles can wrap onto several lines. In these PDFs the author starts
+    # where the large title font changes to the smaller cover-text font.
+    rows = defaultdict(list)
+    for char in page.chars:
+        if char['text'].strip():
+            rows[round(char['top'], 1)].append(char)
+    title_line_count = 1
+    if len(rows) == len(lines):
+        sizes = [median(char['size'] for char in chars)
+                 for _, chars in sorted(rows.items())]
+        title_line_count = next((i for i in range(1, len(sizes))
+                                 if sizes[i] < sizes[0] * .8), 1)
+    title = ''.join(lines[:title_line_count])
+    author = lines[title_line_count] if title_line_count < len(lines) else ''
+    return title, author, lines[title_line_count + 1:]
+
+
 def extract(pdf_path: Path, title_override=None, author_override=None):
     diagnostics = {'removed_page_numbers': [], 'ruby_count': 0,
                    'ruby_ambiguous': [], 'unassigned_small_text': [],
@@ -178,16 +200,16 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
     with pdfplumber.open(pdf_path) as pdf:
         if not pdf.pages:
             raise ValueError('PDFにページがありません。')
-        cover_lines = (pdf.pages[0].extract_text() or '').splitlines()
-        title = title_override or (cover_lines[0].strip() if cover_lines else '')
-        author = author_override or (cover_lines[1].strip() if len(cover_lines) > 1 else '')
+        cover_title, cover_author, cover_extra = _cover_fields(pdf.pages[0])
+        title = title_override or cover_title
+        author = author_override or cover_author
         if not title:
             raise ValueError('表紙からタイトルを取得できません。--title を指定してください。')
         if not author:
             raise ValueError('表紙から著者を取得できません。--author を指定してください。')
         cover_paragraphs = [Paragraph([(author, None)], pages=[1])]
         cover_paragraphs.extend(Paragraph([(line.strip(), None)], pages=[1])
-                                for line in cover_lines[2:] if line.strip())
+                                for line in cover_extra)
         sections.append(Section(title, 1, cover_paragraphs))
         # A centered footer on an early page also identifies a shifted first footer.
         for sample_page in pdf.pages[2:6]:
