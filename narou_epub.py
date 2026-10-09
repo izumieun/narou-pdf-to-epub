@@ -69,6 +69,22 @@ def _add_parts(node, parts):
             last.tail = (last.tail or '') + base
 
 
+def _ruby_runs(chars):
+    """Split annotations sharing an x coordinate at vertical whitespace.
+
+    Character origins alone do not identify a ruby: several unrelated words
+    may be annotated in the same column. Keep normal glyph spacing together.
+    """
+    runs = []
+    for char in sorted(chars, key=lambda c: c['top']):
+        if not runs or char['top'] - runs[-1][-1]['bottom'] > min(
+                char['size'], runs[-1][-1]['size']) * .5:
+            runs.append([char])
+        else:
+            runs[-1].append(char)
+    return runs
+
+
 def _column_parts(chars, ruby_groups, column_x, body_size, diagnostics, page_number):
     ordered = sorted(chars, key=lambda c: -c['matrix'][5])
     used = set()
@@ -272,9 +288,14 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
             small_groups = defaultdict(list)
             for c in small:
                 small_groups[round(c['matrix'][4], 1)].append(c)
+            # Split before choosing a base column so unrelated annotations do
+            # not influence either column selection or the base text range.
+            small_groups = {(rx, i): run for rx, chars in small_groups.items()
+                            for i, run in enumerate(_ruby_runs(chars))}
             remaining = set(small_groups)
             attached_to = defaultdict(list)
-            for rx, group in small_groups.items():
+            for key, group in small_groups.items():
+                rx, _ = key
                 low, high = min(c['top'] for c in group), max(c['bottom'] for c in group)
                 candidates = [(-sum(c['top'] < high and c['bottom'] > low for c in cs),
                                x >= rx, abs(x - rx), x)
@@ -282,7 +303,7 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
                 if candidates:
                     _, _, _, closest = min(candidates)
                     attached_to[closest].append(group)
-                    remaining.discard(rx)
+                    remaining.discard(key)
             column_data = []
             for x, cs in columns:
                 attached = attached_to[x]
@@ -292,9 +313,10 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
                                     'bold': bold, 'page': page.page_number,
                                     'top': min(c['top'] for c in cs),
                                     'bottom': max(c['bottom'] for c in cs)})
-            for rx in remaining:
+            for key in sorted(remaining):
+                rx, _ = key
                 diagnostics['unassigned_small_text'].append({'page': page.page_number, 'x': rx,
-                                                             'count': len(small_groups[rx])})
+                                                             'count': len(small_groups[key])})
             nonbold_xs = [c['x'] for c in column_data if not c['bold']]
             right_body = max(nonbold_xs, default=float('-inf'))
             for col in column_data:

@@ -139,6 +139,29 @@ class ConverterTests(TestCase):
                 self.assertEqual([(node.text, node.findtext(f'{{{XHTML}}}rt'))
                                   for node in ruby_nodes], [('丙', 'るび')])
 
+    def test_multiple_rubies_in_one_column_keep_separate_base_ranges(self):
+        # Each word has its own annotation, with unannotated text in between.
+        pages = [FakePage(1, [], cover='題名\n著者'),
+                 FakePage(2, [chars('第一話', 180, bold=True), chars('山と川と海です', 100),
+                              chars('やま', 111, size=7, top=20),
+                              chars('かわ', 111, size=7, top=48),
+                              chars('うみ', 111, size=7, top=76)])]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            title, author, sections, diagnostics = extract(Path('sample.pdf'))
+        paragraph = sections[1].paragraphs[-1]
+        self.assertEqual(paragraph.text, '山と川と海です')
+        expected = [('山', 'やま'), ('川', 'かわ'), ('海', 'うみ')]
+        self.assertEqual([(b, r) for b, r in paragraph.parts if r], expected)
+        self.assertEqual(diagnostics['ruby_count'], 3)
+        self.assertEqual(diagnostics['ruby_ambiguous'], [])
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'book.epub'
+            build_epub(target, title, author, sections)
+            with ZipFile(target) as archive:
+                chapter = ET.fromstring(archive.read('OEBPS/chapter-002.xhtml'))
+                self.assertEqual([(n.text, n.findtext(f'{{{XHTML}}}rt'))
+                                  for n in chapter.findall(f'.//{{{XHTML}}}ruby')], expected)
+
     def test_page_number_is_removed_when_small_body_dots_reach_footer_area(self):
         body = chars('　これは検証用の文です。点を残します。', 100)
         page = FakePage(2, [body], footer='3661')
