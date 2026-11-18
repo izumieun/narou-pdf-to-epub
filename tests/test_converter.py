@@ -1,4 +1,5 @@
 from contextlib import redirect_stdout
+import errno
 from io import StringIO
 import tempfile
 from pathlib import Path
@@ -7,7 +8,7 @@ from zipfile import ZipFile
 from pdfminer.psparser import LIT
 import xml.etree.ElementTree as ET
 
-from narou_epub import _column_parts, build_epub, extract, main as convert_main, validate_epub, DC, XHTML
+from narou_epub import _column_parts, _convert_one, build_epub, extract, main as convert_main, validate_epub, DC, XHTML
 
 
 def chars(text, x, *, bold=False, size=14, top=20):
@@ -39,6 +40,9 @@ class FakePage:
 
     def extract_text(self):
         return self.cover or ''
+
+    def close(self):
+        pass
 
 
 class FakePdf:
@@ -407,6 +411,25 @@ class ConverterTests(TestCase):
                     convert_main([str(source), str(target)])
             validate_epub(target, 1)
             self.assertTrue(target.with_suffix('.report.json').is_file())
+
+    def test_disk_full_or_interrupt_keeps_existing_output_and_cleans_work_directory(self):
+        pages = [FakePage(1, [], cover='題名\n著者'),
+                 FakePage(2, [chars('　本文です', 160)])]
+        for error in (OSError(errno.ENOSPC, 'No space left'), KeyboardInterrupt()):
+            with self.subTest(error=type(error)), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, target = root / 'book.pdf', root / 'book.epub'
+                report = root / 'book.report.json'
+                source.write_bytes(b'sample')
+                target.write_bytes(b'existing epub')
+                report.write_bytes(b'existing report')
+                with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)), \
+                        mock.patch('narou_epub._write_report', side_effect=error):
+                    with self.assertRaises(type(error)):
+                        _convert_one(source, target, report)
+                self.assertEqual(target.read_bytes(), b'existing epub')
+                self.assertEqual(report.read_bytes(), b'existing report')
+                self.assertEqual(set(root.iterdir()), {source, target, report})
 
     def test_batch_failure_does_not_prevent_next_pdf(self):
         pages = [FakePage(1, [], cover='題名\n著者'),

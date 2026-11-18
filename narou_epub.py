@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict, deque
+from collections import Counter, defaultdict
+from contextlib import closing, ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -11,6 +12,7 @@ import json
 from pathlib import Path
 from statistics import median
 import sys
+from tempfile import TemporaryDirectory, TemporaryFile
 import uuid
 import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
@@ -92,17 +94,19 @@ def _xml(root) -> bytes:
 
 
 def _add_parts(node, parts):
-    last = None
+    last = node
+    plain = []
     for base, annotation in parts:
         if annotation:
-            ruby = _element(node, f'{{{XHTML}}}ruby')
-            ruby.text = base
-            _element(ruby, f'{{{XHTML}}}rt', annotation)
-            last = ruby
-        elif last is None:
-            node.text = (node.text or '') + base
+            if plain:
+                setattr(last, 'text' if last is node else 'tail', ''.join(plain))
+                plain.clear()
+            last = _element(node, 'ruby', base)
+            _element(last, 'rt', annotation)
         else:
-            last.tail = (last.tail or '') + base
+            plain.append(base)
+    if plain:
+        setattr(last, 'text' if last is node else 'tail', ''.join(plain))
 
 
 def _ruby_runs(chars):
@@ -162,8 +166,10 @@ def _column_parts(chars, ruby_groups, column_x, body_size, diagnostics, page_num
             parts.append((''.join(c['text'] for c in ordered[i:hi + 1]), annotation))
             i = hi + 1
         else:
-            parts.append((ordered[i]['text'], None))
-            i += 1
+            start = i
+            while i < len(ordered) and i not in rubies:
+                i += 1
+            parts.append((''.join(c['text'] for c in ordered[start:i]), None))
     return parts
 
 
@@ -278,13 +284,19 @@ def _boundary_blank(previous, first, grids):
     return left_blank + right_blank
 
 
-def _restore_paragraphs(sections, pages, grids, diagnostics):
+def _restore_paragraphs(section, pages, grids, diagnostics):
+    yield section, None
+    for paragraph in section.paragraphs:
+        yield section, paragraph
     previous = None
-    while pages:
-        number, layout, columns, horizontal = pages.popleft()
+    paragraph = None
+    for number, layout, columns, horizontal in pages:
         if horizontal:
-            sections[-1].paragraphs.extend(Paragraph([(line, None)], pages=[number])
-                                           for line in horizontal)
+            if paragraph is not None:
+                yield section, paragraph
+            for line in horizontal:
+                yield section, Paragraph([(line, None)], pages=[number])
+            paragraph = None
             previous = None
             continue
         _, height, body_size = layout
@@ -300,10 +312,13 @@ def _restore_paragraphs(sections, pages, grids, diagnostics):
             pitch = min(gaps[0], body_size * 1.6) if gaps else body_size * 1.6
         for col in columns:
             if col['heading']:
-                sections.append(Section(col['text'], number))
+                if paragraph is not None:
+                    yield section, paragraph
+                section = Section(col['text'], number)
+                yield section, None
+                paragraph = None
                 previous = None
                 continue
-            section = sections[-1]
             same_page = previous is not None and previous['page'] == number
             blank = 0
             if same_page:
@@ -329,21 +344,42 @@ def _restore_paragraphs(sections, pages, grids, diagnostics):
                 col['text'].startswith(('「', '『')) and previous is not None
                 and previous['bottom'] < height * .8) or short_previous_line
             if previous is None or starts or blank:
-                section.paragraphs.append(Paragraph(blank_before=blank))
-            paragraph = section.paragraphs[-1]
+                if paragraph is not None:
+                    yield section, paragraph
+                paragraph = Paragraph(blank_before=blank)
             paragraph.parts.extend(col['parts'])
-            if number not in paragraph.pages:
+            if not paragraph.pages or paragraph.pages[-1] != number:
                 paragraph.pages.append(number)
             previous = col
+    if paragraph is not None:
+        yield section, paragraph
 
 
-def extract(pdf_path: Path, title_override=None, author_override=None):
-    diagnostics = {'removed_page_numbers': [], 'ruby_count': 0,
-                   'ruby_ambiguous': [], 'unassigned_small_text': [],
-                   'page_boundary_review': [], 'column_gap_review': [],
-                   'skipped_pages': [], 'horizontal_pages': []}
-    sections = []
-    pages = deque()
+def _diagnostics(make_log=list):
+    return {'removed_page_numbers': make_log(), 'ruby_count': 0,
+            'ruby_ambiguous': make_log(), 'unassigned_small_text': make_log(),
+            'page_boundary_review': make_log(), 'column_gap_review': make_log(),
+            'skipped_pages': make_log(), 'horizontal_pages': make_log()}
+
+
+def _save_page(spool, number, layout, columns, horizontal):
+    spool.write(json.dumps((number, layout, columns, horizontal), ensure_ascii=False) + '\n')
+
+
+def _read_pages(spool):
+    spool.seek(0)
+    for line in spool:
+        number, layout, columns, horizontal = json.loads(line)
+        if layout is not None:
+            layout = tuple(layout)
+        for col in columns:
+            col['layout'] = layout
+            col['page'] = number
+            col['parts'] = [tuple(part) for part in col['parts']]
+        yield number, layout, columns, horizontal
+
+
+def _extract_pages(pdf_path, spool, diagnostics, title_override, author_override):
     grid_counts = defaultdict(Counter)
     previous_footer = None
     previous_body_size = None
@@ -352,7 +388,8 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
         pdf.rsrcmgr = _NarouResources()
         if not pdf.pages:
             raise ValueError('PDFにページがありません。')
-        cover_title, cover_author, cover_extra = _cover_fields(pdf.pages[0])
+        with closing(pdf.pages[0]) as cover:
+            cover_title, cover_author, cover_extra = _cover_fields(cover)
         title = title_override or cover_title
         author = author_override or cover_author
         if not title:
@@ -362,142 +399,184 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
         cover_paragraphs = [Paragraph([(author, None)], pages=[1])]
         cover_paragraphs.extend(Paragraph([(line.strip(), None)], pages=[1])
                                 for line in cover_extra)
-        sections.append(Section(title, 1, cover_paragraphs))
+        cover = Section(title, 1, cover_paragraphs)
         # A centered footer on an early page also identifies a shifted first footer.
         for sample_page in pdf.pages[2:6]:
-            if not sample_page.chars:
-                continue
-            sample_size = Counter(round(c['size'], 1) for c in sample_page.chars).most_common(1)[0][0]
-            sample_footer = _page_number_group(sample_page.chars, sample_page.width,
-                                                sample_page.height, sample_size)
-            if sample_footer:
-                previous_footer = _footer_reference(sample_page, sample_footer)
-                break
+            with closing(sample_page):
+                if not sample_page.chars:
+                    continue
+                sample_size = Counter(round(c['size'], 1) for c in sample_page.chars).most_common(1)[0][0]
+                sample_footer = _page_number_group(sample_page.chars, sample_page.width,
+                                                    sample_page.height, sample_size)
+                if sample_footer:
+                    previous_footer = _footer_reference(sample_page, sample_footer)
+                    break
         for page in pdf.pages[1:]:
-            if not page.chars:
-                diagnostics['skipped_pages'].append(page.page_number)
-                continue
-            sizes = Counter(round(c['size'], 1) for c in page.chars)
-            body_size = sizes.most_common(1)[0][0]
-            if previous_body_size and body_size < previous_body_size * .75:
-                prior_columns = Counter(round(c['matrix'][4], 2) for c in page.chars
-                                        if abs(c['size'] - previous_body_size) <= .25)
-                if max(prior_columns.values(), default=0) >= 4:
-                    body_size = previous_body_size
-            previous_body_size = body_size
-            # Reject pages made of horizontal colophon text instead of vertical columns.
-            footer = _page_number_group(page.chars, page.width, page.height, body_size,
-                                        previous_footer, page.page_number)
-            footer_ids = {id(c) for c in footer}
-            groups = defaultdict(list)
-            small = []
-            for c in page.chars:
-                if id(c) in footer_ids:
-                    continue
-                if abs(c['size'] - body_size) <= .25:
-                    groups[round(c['matrix'][4], 2)].append(c)
-                else:
-                    small.append(c)
-            if footer:
-                footer_text = ''.join(c['text'] for c in footer)
-                diagnostics['removed_page_numbers'].append(
-                    {'page': page.page_number, 'number': footer_text})
-                previous_footer = _footer_reference(page, footer)
-            columns = [(x, cs) for x, cs in sorted(groups.items(), reverse=True) if len(cs) >= 2]
-            row_counts = Counter(round(c['top'], 1) for cs in groups.values() for c in cs)
-            tallest_column = max((len(cs) for _, cs in columns), default=0)
-            looks_horizontal = max(row_counts.values(), default=0) > tallest_column * 2
-            if tallest_column < 4 or looks_horizontal:
-                lines = [line.strip() for line in (page.extract_text() or '').splitlines() if line.strip()]
-                if lines and lines[-1].isdecimal():
-                    number = lines.pop()
-                    if not footer or number != footer_text:
-                        diagnostics['removed_page_numbers'].append({'page': page.page_number,
-                                                                     'number': number})
-                if lines:
-                    diagnostics['horizontal_pages'].append(page.page_number)
-                    pages.append((page.page_number, None, [], lines))
-                else:
+            with closing(page):
+                if not page.chars:
                     diagnostics['skipped_pages'].append(page.page_number)
-                continue
-            small_groups = defaultdict(list)
-            for c in small:
-                small_groups[round(c['matrix'][4], 1)].append(c)
-            # Split before choosing a base column so unrelated annotations do
-            # not influence either column selection or the base text range.
-            small_groups = {(rx, i): run for rx, chars in small_groups.items()
-                            for i, run in enumerate(_ruby_runs(chars))}
-            remaining = set(small_groups)
-            attached_to = defaultdict(list)
-            for key, group in small_groups.items():
-                rx, _ = key
-                low, high = min(c['top'] for c in group), max(c['bottom'] for c in group)
-                candidates = [(-sum(c['top'] < high and c['bottom'] > low for c in cs),
-                               x >= rx, abs(x - rx), x)
-                              for x, cs in columns if body_size * .3 < abs(x - rx) < body_size]
-                if candidates:
-                    _, _, _, closest = min(candidates)
-                    attached_to[closest].append(group)
-                    remaining.discard(key)
-            layout = (round(page.width, 1), round(page.height, 1), body_size)
-            column_data = []
-            for x, cs in columns:
-                attached = attached_to[x]
-                parts = _column_parts(cs, attached, x, body_size, diagnostics, page.page_number)
-                bold = sum('Bold' in c['fontname'] for c in cs) / len(cs) >= .8
-                col_text = ''.join(v for v, _ in parts)
-                if not col_text.strip():
                     continue
-                column_data.append({'x': x, 'parts': parts, 'text': col_text,
-                                    'bold': bold, 'page': page.page_number,
-                                    'layout': layout,
-                                    'top': min(c['top'] for c in cs),
-                                    'bottom': max(c['bottom'] for c in cs)})
-            for key in sorted(remaining):
-                rx, _ = key
-                diagnostics['unassigned_small_text'].append({'page': page.page_number, 'x': rx,
-                                                             'count': len(small_groups[key])})
-            nonbold_xs = [c['x'] for c in column_data if not c['bold']]
-            right_body = max(nonbold_xs, default=float('-inf'))
-            for col in column_data:
-                col['heading'] = col['bold'] and col['x'] > right_body + body_size * 2
-            body_xs = [c['x'] for c in column_data if not c['heading']]
-            vertical_body_count += len(body_xs)
-            if len(body_xs) == len(column_data):
-                grid = _body_grid(body_xs, body_size)
-                if grid is not None:
-                    grid_counts[layout][grid] += 1
-            if column_data:
-                pages.append((page.page_number, layout, column_data, []))
+                sizes = Counter(round(c['size'], 1) for c in page.chars)
+                body_size = sizes.most_common(1)[0][0]
+                if previous_body_size and body_size < previous_body_size * .75:
+                    prior_columns = Counter(round(c['matrix'][4], 2) for c in page.chars
+                                            if abs(c['size'] - previous_body_size) <= .25)
+                    if max(prior_columns.values(), default=0) >= 4:
+                        body_size = previous_body_size
+                previous_body_size = body_size
+                # 横書きの奥付を縦書きの本文として扱わない。
+                footer = _page_number_group(page.chars, page.width, page.height, body_size,
+                                            previous_footer, page.page_number)
+                footer_ids = {id(c) for c in footer}
+                groups = defaultdict(list)
+                small = []
+                for c in page.chars:
+                    if id(c) in footer_ids:
+                        continue
+                    if abs(c['size'] - body_size) <= .25:
+                        groups[round(c['matrix'][4], 2)].append(c)
+                    else:
+                        small.append(c)
+                if footer:
+                    footer_text = ''.join(c['text'] for c in footer)
+                    diagnostics['removed_page_numbers'].append(
+                        {'page': page.page_number, 'number': footer_text})
+                    previous_footer = _footer_reference(page, footer)
+                columns = [(x, cs) for x, cs in sorted(groups.items(), reverse=True) if len(cs) >= 2]
+                row_counts = Counter(round(c['top'], 1) for cs in groups.values() for c in cs)
+                tallest_column = max((len(cs) for _, cs in columns), default=0)
+                looks_horizontal = max(row_counts.values(), default=0) > tallest_column * 2
+                if tallest_column < 4 or looks_horizontal:
+                    lines = [line.strip() for line in (page.extract_text() or '').splitlines() if line.strip()]
+                    if lines and lines[-1].isdecimal():
+                        number = lines.pop()
+                        if not footer or number != footer_text:
+                            diagnostics['removed_page_numbers'].append({'page': page.page_number,
+                                                                         'number': number})
+                    if lines:
+                        diagnostics['horizontal_pages'].append(page.page_number)
+                        _save_page(spool, page.page_number, None, [], lines)
+                    else:
+                        diagnostics['skipped_pages'].append(page.page_number)
+                    continue
+                small_groups = defaultdict(list)
+                for c in small:
+                    small_groups[round(c['matrix'][4], 1)].append(c)
+                # 別々のルビが本文列や親文字の判定に影響しないよう、先に分割する。
+                small_groups = {(rx, i): run for rx, chars in small_groups.items()
+                                for i, run in enumerate(_ruby_runs(chars))}
+                remaining = set(small_groups)
+                attached_to = defaultdict(list)
+                for key, group in small_groups.items():
+                    rx, _ = key
+                    low, high = min(c['top'] for c in group), max(c['bottom'] for c in group)
+                    candidates = [(-sum(c['top'] < high and c['bottom'] > low for c in cs),
+                                   x >= rx, abs(x - rx), x)
+                                  for x, cs in columns if body_size * .3 < abs(x - rx) < body_size]
+                    if candidates:
+                        _, _, _, closest = min(candidates)
+                        attached_to[closest].append(group)
+                        remaining.discard(key)
+                layout = (round(page.width, 1), round(page.height, 1), body_size)
+                column_data = []
+                for x, cs in columns:
+                    attached = attached_to[x]
+                    parts = _column_parts(cs, attached, x, body_size, diagnostics, page.page_number)
+                    bold = sum('Bold' in c['fontname'] for c in cs) / len(cs) >= .8
+                    col_text = ''.join(v for v, _ in parts)
+                    if not col_text.strip():
+                        continue
+                    column_data.append({'x': x, 'parts': parts, 'text': col_text,
+                                        'bold': bold,
+                                        'top': min(c['top'] for c in cs),
+                                        'bottom': max(c['bottom'] for c in cs)})
+                for key in sorted(remaining):
+                    rx, _ = key
+                    diagnostics['unassigned_small_text'].append({'page': page.page_number, 'x': rx,
+                                                                 'count': len(small_groups[key])})
+                nonbold_xs = [c['x'] for c in column_data if not c['bold']]
+                right_body = max(nonbold_xs, default=float('-inf'))
+                for col in column_data:
+                    col['heading'] = col['bold'] and col['x'] > right_body + body_size * 2
+                body_xs = [c['x'] for c in column_data if not c['heading']]
+                vertical_body_count += len(body_xs)
+                if len(body_xs) == len(column_data):
+                    grid = _body_grid(body_xs, body_size)
+                    if grid is not None:
+                        grid_counts[layout][grid] += 1
+                if column_data:
+                    _save_page(spool, page.page_number, layout, column_data, [])
     if not vertical_body_count:
         raise ValueError('縦書き本文を抽出できません。画像PDFや異なるレイアウトの可能性があります。')
     # Prefer the most common regular layout and the widest span when tied.
     grids = {layout: max(counts, key=lambda g: (counts[g], g[1] - g[0]))
              for layout, counts in grid_counts.items()}
-    _restore_paragraphs(sections, pages, grids, diagnostics)
+    return title, author, cover, grids
+
+
+def extract(pdf_path: Path, title_override=None, author_override=None):
+    """段落データを必要とする呼び出し元向けに、抽出結果を全巻分まとめる。"""
+    diagnostics = _diagnostics()
+    sections = []
+    with TemporaryFile(mode='w+t', encoding='utf-8') as spool:
+        title, author, cover, grids = _extract_pages(
+            pdf_path, spool, diagnostics, title_override, author_override)
+        for section, paragraph in _restore_paragraphs(
+                cover, _read_pages(spool), grids, diagnostics):
+            if paragraph is None:
+                sections.append(Section(section.title, section.page))
+            else:
+                sections[-1].paragraphs.append(paragraph)
     return title, author, sections, diagnostics
 
 
-def _chapter_xhtml(section: Section, index: int) -> bytes:
+_CHAPTER_END = b'</body></html>'
+
+
+def _chapter_start(section: Section, index: int) -> bytes:
     html = ET.Element(f'{{{XHTML}}}html', {'lang': 'ja', '{http://www.w3.org/XML/1998/namespace}lang': 'ja'})
     head = _element(html, f'{{{XHTML}}}head')
     _element(head, f'{{{XHTML}}}title', section.title)
     _element(head, f'{{{XHTML}}}link', rel='stylesheet', href='style.css', type='text/css')
     body = _element(html, f'{{{XHTML}}}body')
     _element(body, f'{{{XHTML}}}h1', section.title, id=f'section-{index:03d}')
-    for paragraph in section.paragraphs:
-        if not paragraph.text.strip():
-            continue
-        p = _element(body, f'{{{XHTML}}}p', **(
-            {'class': f'scene-break-{paragraph.blank_before}'} if paragraph.blank_before else {}))
-        _add_parts(p, paragraph.parts)
-    return _xml(html)
+    return _xml(html).removesuffix(_CHAPTER_END)
 
 
-def build_epub(path: Path, title: str, author: str, sections: list[Section]):
+def _paragraph_xml(paragraph):
+    # この断片には、章のルート要素で宣言したXHTMLの名前空間が適用される。
+    attrs = {'class': f'scene-break-{paragraph.blank_before}'} if paragraph.blank_before else {}
+    p = ET.Element('p', attrs)
+    _add_parts(p, paragraph.parts)
+    return ET.tostring(p, encoding='utf-8')
+
+
+def _write_chapters(archive, events):
+    sections = []
     blank_counts = {1, 2, 3}
-    blank_counts.update(p.blank_before for section in sections for p in section.paragraphs
-                        if p.blank_before > 3)
+    chapter = None
+    with ExitStack() as stack:
+        for section, paragraph in events:
+            if paragraph is None:
+                if chapter is not None:
+                    chapter.write(_CHAPTER_END)
+                    stack.close()
+                sections.append({'title': section.title, 'page': section.page, 'paragraphs': 0})
+                index = len(sections)
+                chapter = stack.enter_context(archive.open(f'OEBPS/chapter-{index:03d}.xhtml', 'w'))
+                chapter.write(_chapter_start(section, index))
+                continue
+            sections[-1]['paragraphs'] += 1
+            if paragraph.blank_before:
+                blank_counts.add(paragraph.blank_before)
+            if any(base.strip() for base, _ in paragraph.parts):
+                chapter.write(_paragraph_xml(paragraph))
+        if chapter is not None:
+            chapter.write(_CHAPTER_END)
+    return sections, blank_counts
+
+
+def _write_package(archive, title, author, sections, blank_counts):
     blank_styles = ''.join(f'p.scene-break-{n} {{ margin-block-start: {n}.5em; }}\n'
                            for n in sorted(blank_counts))
     book_id = f'urn:uuid:{uuid.uuid4()}'
@@ -534,7 +613,6 @@ def build_epub(path: Path, title: str, author: str, sections: list[Section]):
     doc_title = _element(ncx, f'{{{NCX}}}docTitle')
     _element(doc_title, f'{{{NCX}}}text', title)
     nav_map = _element(ncx, f'{{{NCX}}}navMap')
-    contents = {}
     for i, section in enumerate(sections, 1):
         name = f'chapter-{i:03d}.xhtml'
         anchor = f'{name}#section-{i:03d}'
@@ -542,13 +620,12 @@ def build_epub(path: Path, title: str, author: str, sections: list[Section]):
                  **{'media-type': 'application/xhtml+xml'})
         _element(spine, f'{{{OPF}}}itemref', idref=f'chapter-{i:03d}')
         li = _element(ol, f'{{{XHTML}}}li')
-        _element(li, f'{{{XHTML}}}a', section.title, href=anchor)
+        _element(li, f'{{{XHTML}}}a', section['title'], href=anchor)
         point = _element(nav_map, f'{{{NCX}}}navPoint', id=f'nav-{i:03d}', playOrder=str(i))
         label = _element(point, f'{{{NCX}}}navLabel')
-        _element(label, f'{{{NCX}}}text', section.title)
+        _element(label, f'{{{NCX}}}text', section['title'])
         _element(point, f'{{{NCX}}}content', src=anchor)
-        contents[f'OEBPS/{name}'] = _chapter_xhtml(section, i)
-    contents.update({'META-INF/container.xml': _xml(container),
+    contents = {'META-INF/container.xml': _xml(container),
                      'OEBPS/package.opf': _xml(package),
                      'OEBPS/nav.xhtml': _xml(nav_html),
                      'OEBPS/toc.ncx': _xml(ncx),
@@ -558,11 +635,40 @@ def build_epub(path: Path, title: str, author: str, sections: list[Section]):
                                          'h1 { font-size: 1.25em; margin-block: 0 1.5em; }\n'
                                          'p { margin-block: 0; text-indent: 0; }\n'
                                          + blank_styles +
-                                         'rt { font-size: 0.5em; }\n').encode('utf-8')})
-    with ZipFile(path, 'w') as archive:
+                                         'rt { font-size: 0.5em; }\n').encode('utf-8')}
+    for name, data in contents.items():
+        archive.writestr(name, data)
+
+
+def _write_epub(path, title, author, events):
+    with ZipFile(path, 'w', compression=ZIP_DEFLATED) as archive:
         archive.writestr(ZipInfo('mimetype'), 'application/epub+zip', compress_type=ZIP_STORED)
-        for name, data in contents.items():
-            archive.writestr(name, data, compress_type=ZIP_DEFLATED)
+        sections, blank_counts = _write_chapters(archive, events)
+        _write_package(archive, title, author, sections, blank_counts)
+    return sections
+
+
+def build_epub(path: Path, title: str, author: str, sections: list[Section]):
+    def events():
+        for section in sections:
+            yield section, None
+            for paragraph in section.paragraphs:
+                yield section, paragraph
+
+    _write_epub(path, title, author, events())
+
+
+class _AnchorCheck:
+    """章のXMLツリーを保持せず、目次リンクの移動先を確認する。"""
+
+    def __init__(self, anchors):
+        self.remaining = set(anchors)
+
+    def start(self, tag, attrs):
+        self.remaining.discard(attrs.get('id'))
+
+    def close(self):
+        return self.remaining
 
 
 def validate_epub(path: Path, expected_sections: int):
@@ -573,9 +679,6 @@ def validate_epub(path: Path, expected_sections: int):
         names = set(z.namelist())
         if z.namelist()[0] != 'mimetype' or z.getinfo('mimetype').compress_type != ZIP_STORED:
             raise ValueError('EPUB mimetype が不正です。')
-        for name in names:
-            if name.endswith(('.opf', '.xhtml', '.ncx', '.xml')):
-                ET.fromstring(z.read(name))
         package = ET.fromstring(z.read('OEBPS/package.opf'))
         manifest = package.find(f'{{{OPF}}}manifest')
         spine = package.find(f'{{{OPF}}}spine')
@@ -591,46 +694,105 @@ def validate_epub(path: Path, expected_sections: int):
         links = nav.findall(f'.//{{{XHTML}}}a')
         if len(links) != expected_sections:
             raise ValueError('目次項目数が一致しません。')
+        anchors = defaultdict(set)
         for link in links:
             file, anchor = link.get('href').split('#', 1)
-            root = ET.fromstring(z.read('OEBPS/' + file))
-            if not any(el.get('id') == anchor for el in root.iter()):
+            target = 'OEBPS/' + file
+            if target not in names:
                 raise ValueError(f'目次リンク先がありません: {file}#{anchor}')
+            anchors[target].add(anchor)
         ncx = ET.fromstring(z.read('OEBPS/toc.ncx'))
         points = ncx.findall(f'.//{{{NCX}}}navPoint')
         if len(points) != expected_sections:
             raise ValueError('NCX目次項目数が一致しません。')
         if [point.find(f'{{{NCX}}}content').get('src') for point in points] != [link.get('href') for link in links]:
             raise ValueError('EPUB 3とNCXの目次リンクが一致しません。')
+        parsed = {'OEBPS/package.opf', 'OEBPS/nav.xhtml', 'OEBPS/toc.ncx'}
+        for name in sorted((names - parsed) | anchors.keys()):
+            if name not in anchors and not name.endswith(('.opf', '.xhtml', '.ncx', '.xml')):
+                continue
+            parser = ET.XMLParser(target=_AnchorCheck(anchors.get(name, ())))
+            with z.open(name) as member:
+                while chunk := member.read(65536):
+                    parser.feed(chunk)
+            missing = parser.close()
+            if missing:
+                raise ValueError(f'目次リンク先がありません: {name}#{min(missing)}')
 
 
 def _protected(path: Path) -> bool:
     return any(part.casefold() == '.dev' for part in path.resolve().parts)
 
 
+class _DiagnosticLog:
+    def __init__(self, stream):
+        self.stream = stream
+
+    def append(self, value):
+        self.stream.write(json.dumps(value, ensure_ascii=False) + '\n')
+
+    def write_array(self, target):
+        self.stream.seek(0)
+        target.write('[')
+        separator = ''
+        for line in self.stream:
+            record = json.dumps(json.loads(line), ensure_ascii=False, indent=2)
+            target.write(separator + '\n      ' + record.replace('\n', '\n      '))
+            separator = ','
+        target.write('\n    ]' if separator else ']')
+
+
+def _write_report(path, summary, diagnostics):
+    with path.open('w', encoding='utf-8') as target:
+        target.write(json.dumps(summary, ensure_ascii=False, indent=2).removesuffix('\n}'))
+        target.write(',\n  "diagnostics": {')
+        separator = ''
+        for key, value in diagnostics.items():
+            target.write(separator + '\n    ' + json.dumps(key) + ': ')
+            if isinstance(value, _DiagnosticLog):
+                value.write_array(target)
+            else:
+                target.write(json.dumps(value))
+            separator = ','
+        target.write('\n  }\n}')
+
+
 def _convert_one(source: Path, output: Path, report: Path, title_override=None,
                  author_override=None):
     with source.open('rb') as stream:
         source_hash = hashlib.file_digest(stream, 'sha256').hexdigest()
-    title, author, sections, diagnostics = extract(source, title_override, author_override)
-    temporary = output.with_name(output.name + '.tmp')
-    if temporary.exists():
-        raise ValueError(f'一時ファイルが既にあります: {temporary}')
-    try:
-        build_epub(temporary, title, author, sections)
+    with ExitStack() as stack:
+        work = Path(stack.enter_context(TemporaryDirectory(dir=output.parent, prefix='.narou-')))
+        spool = stack.enter_context((work / 'pages.jsonl').open('w+', encoding='utf-8'))
+
+        def make_log():
+            stream = stack.enter_context(TemporaryFile(mode='w+t', encoding='utf-8', dir=work))
+            return _DiagnosticLog(stream)
+
+        diagnostics = _diagnostics(make_log)
+        title, author, cover, grids = _extract_pages(
+            source, spool, diagnostics, title_override, author_override)
+        temporary = work / 'book.epub'
+        sections = _write_epub(temporary, title, author, _restore_paragraphs(
+            cover, _read_pages(spool), grids, diagnostics))
+        spool.close()
+        (work / 'pages.jsonl').unlink()
         validate_epub(temporary, len(sections))
+        paragraph_count = sum(section['paragraphs'] for section in sections)
+        summary = {'title': title, 'author': author, 'source_sha256': source_hash,
+                   'sections': sections, 'paragraph_count': paragraph_count}
+        report_dir = work
+        if report.parent != output.parent:
+            report_dir = Path(stack.enter_context(
+                TemporaryDirectory(dir=report.parent, prefix='.narou-')))
+        temporary_report = report_dir / 'report.json'
+        _write_report(temporary_report, summary, diagnostics)
         with source.open('rb') as stream:
             if hashlib.file_digest(stream, 'sha256').hexdigest() != source_hash:
                 raise ValueError('変換中に入力PDFが変更されました。')
+        temporary_report.replace(report)
         temporary.replace(output)
-    finally:
-        temporary.unlink(missing_ok=True)
-    summary = {'title': title, 'author': author, 'source_sha256': source_hash, 'sections':
-               [{'title': s.title, 'page': s.page, 'paragraphs': len(s.paragraphs)} for s in sections],
-               'paragraph_count': sum(len(s.paragraphs) for s in sections),
-               'diagnostics': diagnostics}
-    report.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(f'EPUB: {output}\n診断: {report}\n目次: {len(sections)}項目、段落: {summary["paragraph_count"]}')
+    print(f'EPUB: {output}\n診断: {report}\n目次: {len(sections)}項目、段落: {paragraph_count}')
 
 
 def main(argv=None):
