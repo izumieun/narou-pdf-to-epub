@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -16,6 +16,42 @@ import xml.etree.ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 import pdfplumber
+from pdfminer.pdffont import PDFCIDFont
+from pdfminer.pdfinterp import PDFResourceManager
+
+
+class _UniJISFont(PDFCIDFont):
+    """Keep UTF-16 characters aligned even outside Adobe's Japanese CID map."""
+
+    def __init__(self, manager, spec):
+        super().__init__(manager, spec)
+        self._unicode_cids = {}
+
+    def decode(self, data):
+        try:
+            text = data.decode('utf-16-be')
+        except UnicodeDecodeError:
+            return super().decode(data)
+        result = []
+        for ch in text:
+            if ch not in self._unicode_cids:
+                mapped = list(super().decode(ch.encode('utf-16-be')))
+                # Negative IDs cannot collide with a real CID. Unmapped
+                # characters use the font's default advance.
+                self._unicode_cids[ch] = mapped[0] if len(mapped) == 1 else -ord(ch) - 1
+            result.append(self._unicode_cids[ch])
+        return result
+
+    def to_unichr(self, cid):
+        return chr(-cid - 1) if cid < 0 else super().to_unichr(cid)
+
+
+class _NarouResources(PDFResourceManager):
+    def get_font(self, objid, spec):
+        if (getattr(spec.get('Subtype'), 'name', '') in ('CIDFontType0', 'CIDFontType2')
+                and getattr(spec.get('Encoding'), 'name', '') in ('UniJIS-UTF16-V', 'UniJIS-UTF16-H')):
+            return _UniJISFont(self, spec)
+        return super().get_font(objid, spec)
 
 
 XHTML = 'http://www.w3.org/1999/xhtml'
@@ -204,16 +240,116 @@ def _cover_fields(page):
     return title, author, lines[title_line_count + 1:]
 
 
+def _body_grid(xs, body_size):
+    """Find the column grid on a regular page with several body columns."""
+    if len(xs) < 4:
+        return None
+    gaps = [round(a - b, 1) for a, b in zip(xs, xs[1:]) if a - b > body_size]
+    if not gaps:
+        return None
+    pitch, count = Counter(gaps).most_common(1)[0]
+    if count < 2 or any(_column_steps(xs[0] - x, pitch) is None for x in xs):
+        return None
+    return xs[-1], xs[0], pitch
+
+
+def _column_steps(distance, pitch):
+    steps = distance / pitch
+    rounded = round(steps)
+    if rounded < 0 or abs(steps - rounded) > .15:
+        return None
+    return rounded
+
+
+def _boundary_blank(previous, first, grids):
+    if previous['page'] + 1 != first['page'] or previous['layout'] != first['layout']:
+        return None
+    grid = grids.get(first['layout'])
+    if grid is None:
+        return None
+    left, right, pitch = grid
+    left_blank = _column_steps(previous['x'] - left, pitch)
+    right_blank = _column_steps(right - first['x'], pitch)
+    width = right - left
+    if (left_blank is None or right_blank is None
+            or previous['x'] - left > width + pitch * .15
+            or right - first['x'] > width + pitch * .15):
+        return None
+    return left_blank + right_blank
+
+
+def _restore_paragraphs(sections, pages, grids, diagnostics):
+    previous = None
+    while pages:
+        number, layout, columns, horizontal = pages.popleft()
+        if horizontal:
+            sections[-1].paragraphs.extend(Paragraph([(line, None)], pages=[number])
+                                           for line in horizontal)
+            previous = None
+            continue
+        _, height, body_size = layout
+        body_xs = [c['x'] for c in columns if not c['heading']]
+        gaps = [a - b for a, b in zip(body_xs, body_xs[1:]) if a - b > body_size]
+        grid = grids.get(layout)
+        if grid:
+            pitch = grid[2]
+        elif len(gaps) >= 2:
+            pitch = median(sorted(gaps)[:len(gaps) // 2])
+        else:
+            # A single observed gap could itself span several columns.
+            pitch = min(gaps[0], body_size * 1.6) if gaps else body_size * 1.6
+        for col in columns:
+            if col['heading']:
+                sections.append(Section(col['text'], number))
+                previous = None
+                continue
+            section = sections[-1]
+            same_page = previous is not None and previous['page'] == number
+            blank = 0
+            if same_page:
+                gap = previous['x'] - col['x']
+                blank = max(0, round(gap / pitch) - 1)
+                if gap > pitch * 1.15 and (_column_steps(gap, pitch) is None or (blank and not grid)):
+                    diagnostics['column_gap_review'].append(
+                        {'page': number, 'from_x': previous['x'], 'to_x': col['x']})
+            elif previous:
+                boundary_blank = _boundary_blank(previous, col, grids)
+                if boundary_blank is None:
+                    diagnostics['page_boundary_review'].append(number)
+                else:
+                    blank = boundary_blank
+            short_previous_line = (same_page and previous['bottom'] < height * .8
+                                   and abs(previous['top'] - col['top']) <= body_size)
+            dialogue_break = False
+            if previous is not None and col['text'].startswith('「'):
+                previous_text = previous['text']
+                dialogue_break = previous_text.endswith('」') or (
+                    previous['page'] + 1 == number and previous_text.endswith('。'))
+            starts = dialogue_break or col['text'].startswith('\u3000') or (
+                col['text'].startswith(('「', '『')) and previous is not None
+                and previous['bottom'] < height * .8) or short_previous_line
+            if previous is None or starts or blank:
+                section.paragraphs.append(Paragraph(blank_before=blank))
+            paragraph = section.paragraphs[-1]
+            paragraph.parts.extend(col['parts'])
+            if number not in paragraph.pages:
+                paragraph.pages.append(number)
+            previous = col
+
+
 def extract(pdf_path: Path, title_override=None, author_override=None):
     diagnostics = {'removed_page_numbers': [], 'ruby_count': 0,
                    'ruby_ambiguous': [], 'unassigned_small_text': [],
-                   'page_boundary_review': [], 'skipped_pages': [], 'horizontal_pages': []}
+                   'page_boundary_review': [], 'column_gap_review': [],
+                   'skipped_pages': [], 'horizontal_pages': []}
     sections = []
-    previous = None
+    pages = deque()
+    grid_counts = defaultdict(Counter)
     previous_footer = None
     previous_body_size = None
     vertical_body_count = 0
     with pdfplumber.open(pdf_path) as pdf:
+        pdf.rsrcmgr = _NarouResources()
         if not pdf.pages:
             raise ValueError('PDFにページがありません。')
         cover_title, cover_author, cover_extra = _cover_fields(pdf.pages[0])
@@ -280,8 +416,7 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
                                                                      'number': number})
                 if lines:
                     diagnostics['horizontal_pages'].append(page.page_number)
-                    for line in lines:
-                        sections[-1].paragraphs.append(Paragraph([(line, None)], pages=[page.page_number]))
+                    pages.append((page.page_number, None, [], lines))
                 else:
                     diagnostics['skipped_pages'].append(page.page_number)
                 continue
@@ -304,13 +439,18 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
                     _, _, _, closest = min(candidates)
                     attached_to[closest].append(group)
                     remaining.discard(key)
+            layout = (round(page.width, 1), round(page.height, 1), body_size)
             column_data = []
             for x, cs in columns:
                 attached = attached_to[x]
                 parts = _column_parts(cs, attached, x, body_size, diagnostics, page.page_number)
                 bold = sum('Bold' in c['fontname'] for c in cs) / len(cs) >= .8
-                column_data.append({'x': x, 'parts': parts, 'text': ''.join(v for v, _ in parts),
+                col_text = ''.join(v for v, _ in parts)
+                if not col_text.strip():
+                    continue
+                column_data.append({'x': x, 'parts': parts, 'text': col_text,
                                     'bold': bold, 'page': page.page_number,
+                                    'layout': layout,
                                     'top': min(c['top'] for c in cs),
                                     'bottom': max(c['bottom'] for c in cs)})
             for key in sorted(remaining):
@@ -322,39 +462,19 @@ def extract(pdf_path: Path, title_override=None, author_override=None):
             for col in column_data:
                 col['heading'] = col['bold'] and col['x'] > right_body + body_size * 2
             body_xs = [c['x'] for c in column_data if not c['heading']]
-            gaps = [a - b for a, b in zip(body_xs, body_xs[1:]) if a - b > body_size]
-            pitch = median(sorted(gaps)[:max(1, len(gaps) // 2)]) if gaps else body_size * 1.6
-            for col in column_data:
-                if col['heading']:
-                    sections.append(Section(col['text'], page.page_number))
-                    previous = None
-                    continue
-                if not sections:
-                    sections.append(Section('本文', page.page_number))
-                section = sections[-1]
-                if not col['text'].strip():
-                    continue
-                vertical_body_count += 1
-                gap = previous['x'] - col['x'] if previous and previous['page'] == page.page_number else None
-                blank = max(0, min(3, round(gap / pitch) - 1)) if gap is not None else 0
-                short_previous_line = (gap is not None and previous['bottom'] < page.height * .8
-                                       and abs(previous['top'] - col['top']) <= body_size)
-                starts = col['text'].startswith('\u3000') or (
-                    col['text'].startswith(('「', '『')) and previous is not None
-                    and previous['bottom'] < page.height * .8) or short_previous_line
-                if not section.paragraphs or starts or blank:
-                    section.paragraphs.append(Paragraph(blank_before=blank))
-                elif previous and previous['page'] != page.page_number:
-                    diagnostics['page_boundary_review'].append(page.page_number)
-                paragraph = section.paragraphs[-1]
-                paragraph.parts.extend(col['parts'])
-                if page.page_number not in paragraph.pages:
-                    paragraph.pages.append(page.page_number)
-                previous = col
+            vertical_body_count += len(body_xs)
+            if len(body_xs) == len(column_data):
+                grid = _body_grid(body_xs, body_size)
+                if grid is not None:
+                    grid_counts[layout][grid] += 1
+            if column_data:
+                pages.append((page.page_number, layout, column_data, []))
     if not vertical_body_count:
         raise ValueError('縦書き本文を抽出できません。画像PDFや異なるレイアウトの可能性があります。')
-    if sections[0].title == '本文':
-        sections[0].title = title
+    # Prefer the most common regular layout and the widest span when tied.
+    grids = {layout: max(counts, key=lambda g: (counts[g], g[1] - g[0]))
+             for layout, counts in grid_counts.items()}
+    _restore_paragraphs(sections, pages, grids, diagnostics)
     return title, author, sections, diagnostics
 
 
@@ -375,6 +495,11 @@ def _chapter_xhtml(section: Section, index: int) -> bytes:
 
 
 def build_epub(path: Path, title: str, author: str, sections: list[Section]):
+    blank_counts = {1, 2, 3}
+    blank_counts.update(p.blank_before for section in sections for p in section.paragraphs
+                        if p.blank_before > 3)
+    blank_styles = ''.join(f'p.scene-break-{n} {{ margin-block-start: {n}.5em; }}\n'
+                           for n in sorted(blank_counts))
     book_id = f'urn:uuid:{uuid.uuid4()}'
     container = ET.Element(f'{{{CONTAINER}}}container', version='1.0')
     rootfiles = _element(container, f'{{{CONTAINER}}}rootfiles')
@@ -432,9 +557,7 @@ def build_epub(path: Path, title: str, author: str, sections: list[Section]):
                                          'body { margin: 0; padding: 0; line-height: 1.6; }\n'
                                          'h1 { font-size: 1.25em; margin-block: 0 1.5em; }\n'
                                          'p { margin-block: 0; text-indent: 0; }\n'
-                                         'p.scene-break-1 { margin-block-start: 1.5em; }\n'
-                                         'p.scene-break-2 { margin-block-start: 2.5em; }\n'
-                                         'p.scene-break-3 { margin-block-start: 3.5em; }\n'
+                                         + blank_styles +
                                          'rt { font-size: 0.5em; }\n').encode('utf-8')})
     with ZipFile(path, 'w') as archive:
         archive.writestr(ZipInfo('mimetype'), 'application/epub+zip', compress_type=ZIP_STORED)

@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest import TestCase, main, mock
 from zipfile import ZipFile
+from pdfminer.psparser import LIT
 import xml.etree.ElementTree as ET
 
 from narou_epub import _column_parts, build_epub, extract, main as convert_main, validate_epub, DC, XHTML
@@ -52,6 +53,16 @@ class FakePdf:
 
 
 class ConverterTests(TestCase):
+    def test_unmapped_myanmar_preserves_following_quote_in_vertical_utf16(self):
+        from narou_epub import _NarouResources
+        font = _NarouResources().get_font(1, {
+            'Subtype': LIT('Type0'), 'Encoding': LIT('UniJIS-UTF16-V'),
+            'DescendantFonts': [{'Subtype': LIT('CIDFontType0'), 'BaseFont': LIT('Test'),
+                                 'CIDSystemInfo': {'Registry': b'Adobe', 'Ordering': b'Japan1'}}],
+        })
+        text = '「ကြိုဆိုပါတယ်」次'
+        self.assertEqual(''.join(font.to_unichr(cid) for cid in font.decode(text.encode('utf-16-be'))), text)
+
     def test_wrapped_cover_title_does_not_become_author(self):
         cover = FakePage(1, [], cover='架空の長い書名\n続き\n仮の著者\n発行元')
         cover.chars = (horizontal_chars('架空の長い書名', 150, size=20, top=20)
@@ -86,6 +97,102 @@ class ConverterTests(TestCase):
                          ['　今日は123456続く', '　次あいうえおかきくけ太字本文', '　翌日ですあいうえお４５'])
         self.assertEqual(sections[1].paragraphs[1].blank_before, 1)
         self.assertEqual([x['number'] for x in diagnostics['removed_page_numbers']], ['1', '2'])
+
+    def test_full_dialogue_column_before_another_utterance(self):
+        for across_page in (False, True):
+            first = chars('「' + '話' * 9 + '」', 160)
+            second = chars('「返事」', 140)
+            pages = [FakePage(1, [], cover='題名\n著者'),
+                     FakePage(2, [chars('第一話', 220, bold=True), first])]
+            if across_page:
+                pages.append(FakePage(3, [second]))
+            else:
+                pages[1].chars.extend(second)
+            with self.subTest(across_page=across_page), mock.patch(
+                    'narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+                _, _, sections, _ = extract(Path('sample.pdf'))
+                self.assertEqual([p.text for p in sections[1].paragraphs],
+                                 ['「' + '話' * 9 + '」', '「返事」'])
+
+    def test_sentence_before_dialogue_starts_paragraph_at_page_boundary(self):
+        sentence = '文' * 10 + '。'
+        dialogue = '「返事」'
+        for across_page in (False, True):
+            pages = [FakePage(1, [], cover='題名\n著者'),
+                     FakePage(2, [chars('第一話', 280, bold=True),
+                                  chars(sentence, 140 if across_page else 240)])]
+            if across_page:
+                pages.append(FakePage(3, [chars(dialogue, 240)]))
+            else:
+                pages[1].chars.extend(chars(dialogue, 220))
+            pages.append(FakePage(len(pages) + 1,
+                                  [chars('文' * 11, x) for x in range(240, 139, -20)]))
+            with self.subTest(across_page=across_page), mock.patch(
+                    'narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+                _, _, sections, _ = extract(Path('sample.pdf'))
+            paragraphs = sections[1].paragraphs
+            if across_page:
+                self.assertEqual(paragraphs[0].text, sentence)
+                self.assertTrue(paragraphs[1].text.startswith(dialogue))
+                self.assertEqual(paragraphs[1].blank_before, 0)
+            else:
+                self.assertTrue(paragraphs[0].text.startswith(sentence + dialogue))
+
+    def test_same_page_counts_wide_gaps_and_reports_uncertain_gaps(self):
+        for left, expected, needs_review in ((140, 4, False), (150, 3, True)):
+            pages = [FakePage(1, [], cover='題名\n著者'),
+                     FakePage(2, [chars('第一話', 280, bold=True), chars('文' * 11, 240),
+                                  chars('次の本文', left)]),
+                     FakePage(3, [chars('文' * 11, x) for x in range(240, 139, -20)])]
+            with self.subTest(left=left), mock.patch(
+                    'narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+                _, _, sections, diagnostics = extract(Path('sample.pdf'))
+                self.assertEqual(sections[1].paragraphs[1].blank_before, expected)
+                self.assertEqual(diagnostics['column_gap_review'],
+                                 [{'page': 2, 'from_x': 240, 'to_x': left}] if needs_review else [])
+
+    def test_page_boundary_restores_empty_columns_on_both_sides(self):
+        def body(x):
+            return chars('文' * 11, x)
+
+        for left, right, expected in ((140, 240, 0), (160, 240, 1), (140, 220, 1),
+                                      (140, 200, 2), (180, 200, 4), (150, 240, None)):
+            # The regular page comes after the boundary being tested.
+            pages = [FakePage(1, [], cover='題名\n著者'),
+                     FakePage(2, [chars('第一話', 280, bold=True), body(240), body(left)]),
+                     FakePage(3, [body(right), body(140)]),
+                     FakePage(4, [body(x) for x in range(240, 139, -20)])]
+            with self.subTest(left=left, right=right), mock.patch(
+                    'narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+                title, author, sections, diagnostics = extract(Path('sample.pdf'))
+                first = next(p for p in sections[1].paragraphs if 3 in p.pages)
+                self.assertEqual(3 in diagnostics['page_boundary_review'], expected is None)
+                if expected:
+                    self.assertEqual((first.pages[0], first.blank_before), (3, expected))
+                else:
+                    self.assertIn(2, first.pages)
+                if expected == 4:
+                    with tempfile.TemporaryDirectory() as directory:
+                        target = Path(directory) / 'book.epub'
+                        build_epub(target, title, author, sections)
+                        with ZipFile(target) as archive:
+                            chapter = ET.fromstring(archive.read('OEBPS/chapter-002.xhtml'))
+                            self.assertIsNotNone(chapter.find(f'.//{{{XHTML}}}p[@class="scene-break-4"]'))
+                            self.assertIn(b'.scene-break-4 { margin-block-start: 4.5em; }',
+                                          archive.read('OEBPS/style.css'))
+
+    def test_page_boundary_blank_is_not_added_at_a_chapter_or_colophon(self):
+        def body(x):
+            return chars('文' * 11, x)
+
+        pages = [FakePage(1, [], cover='題名\n著者'),
+                 FakePage(2, [body(x) for x in range(240, 139, -20)]),
+                 FakePage(3, [chars('次の章', 240, bold=True), body(180)]),
+                 FakePage(4, [horizontal_chars('ABCDEFGHIJK', 150)], cover='発行元')]
+        with mock.patch('narou_epub.pdfplumber.open', return_value=FakePdf(pages)):
+            _, _, sections, diagnostics = extract(Path('sample.pdf'))
+        self.assertEqual([p.blank_before for p in sections[-1].paragraphs], [0, 0])
+        self.assertEqual(diagnostics['page_boundary_review'], [])
 
     def test_short_aligned_columns_keep_list_line_breaks(self):
         entries = ['項目一：説明文一', '項目二：説明文二',
